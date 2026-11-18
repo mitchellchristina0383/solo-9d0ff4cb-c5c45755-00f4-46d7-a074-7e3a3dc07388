@@ -1,15 +1,18 @@
 """Readers for classic PCAP / PCAPNG captures and Ethernet/IPv4/TCP decoding.
 
-Only what the analyzer needs is implemented:
+Only what the analyzers need is implemented:
 
 * classic pcap (both byte orders, microsecond and nanosecond resolution)
 * pcapng (Section Header / Interface Description / Enhanced Packet /
   Simple Packet blocks, per-interface link types)
 * link layers: Ethernet (incl. 802.1Q VLAN tags), raw IPv4, Linux SLL
 
-Anything that is not IPv4/TCP is skipped.  Fragmented IP datagrams are
-skipped as well (IP reassembly is out of scope; the TCP stream they
-belonged to will simply show a gap and be marked unreliable).
+``read_frames`` returns every captured frame (with its wire length, so
+snaplen truncation is detectable); ``read_segments`` decodes TCP segments
+out of those frames.  Anything that is not IPv4/TCP is skipped there.
+Fragmented IP datagrams are skipped as well (IP reassembly is out of
+scope; the TCP stream they belonged to will simply show a gap and be
+marked unreliable).
 """
 
 from __future__ import annotations
@@ -36,6 +39,22 @@ _IPPROTO_TCP = 6
 
 
 @dataclass
+class CapturedFrame:
+    """One frame record as stored in the capture file."""
+
+    ts: float
+    index: int  # position inside the capture file
+    linktype: int
+    data: bytes  # bytes actually captured
+    orig_len: int  # length as it was on the wire
+
+    @property
+    def truncated(self) -> bool:
+        """True when the capture cut the frame short (snaplen)."""
+        return len(self.data) < self.orig_len
+
+
+@dataclass
 class TcpSegment:
     """One decoded TCP segment."""
 
@@ -57,8 +76,8 @@ class TcpSegment:
         return len(self.payload) < self.wire_payload_len
 
 
-def read_segments(data: bytes) -> list[TcpSegment]:
-    """Decode all TCP segments from a capture file (pcap or pcapng)."""
+def read_frames(data: bytes) -> list[CapturedFrame]:
+    """Decode every frame record from a capture file (pcap or pcapng)."""
     if len(data) < 4:
         raise ValueError("file too small to be a pcap/pcapng capture")
     magic = data[:4]
@@ -69,11 +88,21 @@ def read_segments(data: bytes) -> list[TcpSegment]:
     raise ValueError("unsupported capture format (not classic pcap or pcapng)")
 
 
+def read_segments(data: bytes) -> list[TcpSegment]:
+    """Decode all TCP segments from a capture file (pcap or pcapng)."""
+    segments: list[TcpSegment] = []
+    for frame in read_frames(data):
+        seg = decode_frame(frame.linktype, frame.data, frame.ts, frame.index)
+        if seg is not None:
+            segments.append(seg)
+    return segments
+
+
 # ---------------------------------------------------------------------------
 # classic pcap
 # ---------------------------------------------------------------------------
 
-def _read_pcap(data: bytes) -> list[TcpSegment]:
+def _read_pcap(data: bytes) -> list[CapturedFrame]:
     magic = data[:4]
     if magic == b"\xd4\xc3\xb2\xa1":
         endian, nano = "<", False
@@ -88,30 +117,28 @@ def _read_pcap(data: bytes) -> list[TcpSegment]:
     _magic, _maj, _min, _tz, _sig, _snap, linktype = struct.unpack(
         endian + "IHHIIII", data[:24]
     )
-    segments: list[TcpSegment] = []
+    frames: list[CapturedFrame] = []
     offset = 24
     index = 0
     while offset + 16 <= len(data):
-        ts_sec, ts_frac, incl_len, _orig_len = struct.unpack(
+        ts_sec, ts_frac, incl_len, orig_len = struct.unpack(
             endian + "IIII", data[offset : offset + 16]
         )
         offset += 16
         frame = data[offset : offset + incl_len]
         offset += incl_len
         ts = ts_sec + ts_frac / (1e9 if nano else 1e6)
-        seg = decode_frame(linktype, frame, ts, index)
-        if seg is not None:
-            segments.append(seg)
+        frames.append(CapturedFrame(ts, index, linktype, frame, orig_len))
         index += 1
-    return segments
+    return frames
 
 
 # ---------------------------------------------------------------------------
 # pcapng (minimal)
 # ---------------------------------------------------------------------------
 
-def _read_pcapng(data: bytes) -> list[TcpSegment]:
-    segments: list[TcpSegment] = []
+def _read_pcapng(data: bytes) -> list[CapturedFrame]:
+    frames: list[CapturedFrame] = []
     offset = 0
     index = 0
     endian = "<"
@@ -139,26 +166,22 @@ def _read_pcapng(data: bytes) -> list[TcpSegment]:
             linktype = struct.unpack_from(endian + "H", body, 0)[0]
             linktypes.append(linktype)
         elif block_type == 0x00000006:  # Enhanced Packet Block
-            if_id, ts_hi, ts_lo, cap_len, _orig_len = struct.unpack_from(
+            if_id, ts_hi, ts_lo, cap_len, orig_len = struct.unpack_from(
                 endian + "IIIII", body, 0
             )
             frame = body[20 : 20 + cap_len]
             ts = ((ts_hi << 32) | ts_lo) / 1e6  # default resolution: microseconds
             linktype = linktypes[if_id] if if_id < len(linktypes) else LINKTYPE_ETHERNET
-            seg = decode_frame(linktype, frame, ts, index)
-            if seg is not None:
-                segments.append(seg)
+            frames.append(CapturedFrame(ts, index, linktype, frame, orig_len))
             index += 1
         elif block_type == 0x00000003:  # Simple Packet Block
             orig_len = struct.unpack_from(endian + "I", body, 0)[0]
             frame = body[4:]
             linktype = linktypes[0] if linktypes else LINKTYPE_ETHERNET
-            seg = decode_frame(linktype, frame, 0.0, index)
-            if seg is not None:
-                segments.append(seg)
+            frames.append(CapturedFrame(0.0, index, linktype, frame, orig_len))
             index += 1
         offset += block_len
-    return segments
+    return frames
 
 
 # ---------------------------------------------------------------------------
